@@ -1,0 +1,29 @@
+[project]
+name = "sysadmin-mcp-kit"
+version = "0.1.0"
+description = "Secure MCP server for remote SSH command execution and config inspection"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=1.26.0,<2",
+    "paramiko>=4.0.0",
+    "pydantic>=2.11.0",
+    "pyyaml>=6.0.2",
+]
+
+[project.scripts]
+sysadmin-mcp-cli = "sysadmin_mcp_kit.cli:main"
+sysadmin-mcp-client = "sysadmin_mcp_kit.mcp_client_cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.3",
+]
+
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+testpaths = ["tests"]
+norecursedirs = [".venv", "__pycache__", "pytest-cache-files-*"]

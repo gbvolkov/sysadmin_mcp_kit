@@ -1,0 +1,62 @@
+ssh_config_path = "~/.ssh/config"
+
+[server]
+host = "127.0.0.1"
+port = 8000
+streamable_http_path = "/mcp"
+json_response = false
+stateless_http = false
+list_limit = 50
+default_page_lines = 200
+max_page_lines = 500
+hard_page_char_limit = 16000
+cache_ttl_seconds = 900
+max_file_bytes = 1048576
+progress_report_interval_seconds = 1.0
+log_level = "INFO"
+
+[oauth]
+issuer_url = "https://auth.example.com"
+introspection_endpoint = "https://auth.example.com/oauth/introspect"
+resource_server_url = "https://mcp.example.com/mcp"
+client_id = "sysadmin-mcp"
+client_secret = "replace-me"
+required_scope = "sysadmin:mcp"
+allow_insecure_transport = false
+
+[[targets]]
+target_id = "cheetan"
+ssh_alias = "cheetan"
+allowed_paths = ["/etc", "/opt/app/config"]
+default_timeout_seconds = 300
+connect_timeout_seconds = 10
+
+[command_policy]
+sensitive_patterns = [
+  '(?i)\\bsudo\\b',
+  '(?i)\\bsystemctl\\s+(restart|stop)\\b',
+  '(?i)\\bservice\\s+.+\\s+(restart|stop)\\b',
+]
+blocked_patterns = [
+  '(?i)rm\\s+-rf\\s+/\\s*$',
+]
+confirmation_token_length = 8
+
+[redaction]
+sensitive_key_patterns = [
+  'password',
+  'passphrase',
+  'secret',
+  'token',
+  'api[_-]?key',
+  'access[_-]?key',
+  'client[_-]?secret',
+  'private[_-]?key',
+  'credential',
+]
+text_patterns = [
+  '(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----',
+  '(?i)(bearer\\s+)([A-Za-z0-9._~+/=-]+)',
+  '(?im)(^\\s*(?:password|passphrase|secret|token|api[_-]?key|client[_-]?secret|private[_-]?key)\\s*[:=]\\s*)(.+)$',
+  '([a-z]+://[^\\s:/@]+:)([^\\s/@]+)(@)',
+]
