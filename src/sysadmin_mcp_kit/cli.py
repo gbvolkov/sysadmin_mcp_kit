@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 import threading
@@ -12,7 +13,7 @@ from .pagination import CursorCodec, CursorError, Paginator
 from .policy import CommandPolicy
 from .redaction import RedactionResult, Redactor
 from .session import SessionStoreError, TerminalSessionService, parse_builtin_command
-from .ssh import SSHService, SSHServiceError
+from .ssh import PasswordPromptRequest, SSHService, SSHServiceError
 
 YES_ANSWERS = {"y", "yes"}
 QUIT_ANSWERS = {"5", "q", "quit", "exit"}
@@ -193,6 +194,7 @@ class DirectCLI:
             timeout,
             self._report_progress,
             cancel_event,
+            password_prompt_callback=self._prompt_password,
         )
         return self._build_command_payload(
             target_id=target_id,
@@ -244,6 +246,7 @@ class DirectCLI:
             timeout_seconds,
             self._report_progress,
             cancel_event,
+            password_prompt_callback=self._prompt_password,
         )
         payload = self._build_command_payload(
             target_id=session_result.session.target_id,
@@ -486,6 +489,13 @@ class DirectCLI:
     def _report_progress(self, progress: float, message: str) -> None:
         print(f"[{progress:0.2f}] {message}", file=self._stderr)
 
+    def _prompt_password(self, request: PasswordPromptRequest) -> str | None:
+        print(request.prompt, file=self._stderr)
+        if self._input is input:
+            return getpass.getpass("Password: ", stream=self._stderr)
+        print("Password: ", end="", file=self._stderr)
+        return self._input("")
+
     def _print_menu(self) -> None:
         print("", file=self._stderr)
         print("1. list-targets", file=self._stderr)
@@ -553,7 +563,7 @@ def build_parser() -> argparse.ArgumentParser:
     browse_parser.add_argument("--offset", type=int, default=0)
     browse_parser.add_argument("--cursor")
 
-    read_parser = subparsers.add_parser("read-file", help="Read and redact a remote file")
+    read_parser = subparsers.add_parser("read-file", help="Read and redact a remote text file")
     read_parser.add_argument("target_id")
     read_parser.add_argument("path")
     read_parser.add_argument("--page-lines", type=int)

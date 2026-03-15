@@ -375,6 +375,27 @@ def test_interactive_terminal_session_confirms_command_over_streamable_http(sett
     assert "Failed to call tool 'run_command'" not in stderr.getvalue()
 
 
+def test_interactive_terminal_session_handles_password_elicitation_over_streamable_http(settings, fake_ssh_service, token_verifier) -> None:
+    stdout = StringIO()
+    stderr = StringIO()
+    answers = iter(["4", "cheetan", "", "need-password", "", "y", "opensesame", "exit", "5"])
+    server, url = _start_server(settings, fake_ssh_service, token_verifier)
+
+    with server:
+        exit_code = main(
+            ["--url", url, "--token", "good-token", "interactive"],
+            stdout=stdout,
+            stderr=stderr,
+            input_fn=lambda _prompt: next(answers),
+        )
+
+    assert exit_code == 0
+    assert stdout.getvalue() == "password accepted\n"
+    assert "Remote command requested password input." in stderr.getvalue()
+    assert "Password:" in stderr.getvalue()
+    assert "Failed to call tool 'run_command'" not in stderr.getvalue()
+
+
 def test_interactive_terminal_session_renders_output_and_pages_more() -> None:
     stdout = StringIO()
     stderr = StringIO()

@@ -35,3 +35,17 @@ def test_redactor_falls_back_to_text_patterns() -> None:
     assert "letmein" not in result.text
     assert "secret@host" not in result.text
     assert result.replacements >= 3
+
+
+def test_redactor_preserves_env_reference_values() -> None:
+    redactor = Redactor(_Settings())
+    payload = b"PASSWORD=${DB_PASSWORD}\nSECRET=$APP_SECRET\nTOKEN=env_variable\nPASSWORD=actual-secret\n"
+
+    result = redactor.redact_bytes(payload, path=".env")
+
+    assert "PASSWORD=${DB_PASSWORD}" in result.text
+    assert "SECRET=$APP_SECRET" in result.text
+    assert "TOKEN=env_variable" in result.text
+    assert "PASSWORD=<REDACTED>" in result.text
+    assert "actual-secret" not in result.text
+    assert result.replacements == 1

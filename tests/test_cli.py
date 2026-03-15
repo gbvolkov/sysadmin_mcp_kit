@@ -72,6 +72,27 @@ def test_read_file_redacts_and_supports_cursor_paging(settings, fake_ssh_service
     assert next_payload["content"]["start_line"] == 20
 
 
+def test_read_file_returns_binary_metadata_without_content(settings, fake_ssh_service) -> None:
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = main(
+        ["read-file", "cheetan", "/tmp/archive.bin"],
+        settings=settings,
+        ssh_service=fake_ssh_service,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(stdout.getvalue())
+    assert payload["summary"]["binary"] is True
+    assert payload["redaction"]["binary"] is True
+    assert payload["content"] is None
+    assert payload["next_cursor"] is None
+    assert stderr.getvalue() == ""
+
+
 def test_run_command_supports_non_mcp_execution(settings, fake_ssh_service) -> None:
     stdout = StringIO()
     stderr = StringIO()

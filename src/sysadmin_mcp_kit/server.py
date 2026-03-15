@@ -19,7 +19,7 @@ from .policy import CommandPolicy
 from .redaction import RedactionResult, Redactor
 from .result_store import InMemoryResultStore, ResultStoreError
 from .session import TerminalSessionService, parse_builtin_command
-from .ssh import BrowseResult, RemoteFileEntry, SSHService, SSHServiceError
+from .ssh import BrowseResult, PasswordPromptRequest, RemoteFileEntry, SSHService, SSHServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,13 @@ class ApprovalForm(BaseModel):
 class SensitiveApprovalForm(BaseModel):
     approve: bool = Field(description="Set to true to approve the sensitive command.")
     confirmation_token: str = Field(description="Type the exact confirmation token shown in the prompt.")
+
+
+class PasswordPromptForm(BaseModel):
+    password: str = Field(
+        description="Enter the password requested by the remote command.",
+        json_schema_extra={"format": "password", "writeOnly": True},
+    )
 
 
 class TargetInfo(BaseModel):
@@ -150,6 +157,45 @@ class ThreadsafeProgressReporter:
             self._loop,
         )
         future.result(timeout=10)
+
+
+class ThreadsafePasswordRequester:
+    def __init__(self, ctx: Context, *, target_id: str, command: str):
+        self._ctx = ctx
+        self._target_id = target_id
+        self._command = command
+        self._loop = asyncio.get_running_loop()
+
+    def __call__(self, request: PasswordPromptRequest) -> str | None:
+        future = asyncio.run_coroutine_threadsafe(self._request_password(request), self._loop)
+        try:
+            return future.result(timeout=request.timeout_seconds)
+        except TimeoutError as exc:
+            future.cancel()
+            raise SSHServiceError("Timed out while waiting for password input from the client") from exc
+        except Exception as exc:
+            future.cancel()
+            raise SSHServiceError("Failed to collect password input from the client") from exc
+
+    async def _request_password(self, request: PasswordPromptRequest) -> str | None:
+        response = await self._ctx.elicit(
+            message=(
+                "Remote command requested password input.\n"
+                f"Target: {self._target_id}\n"
+                f"Attempt: {request.attempt}\n"
+                "Prompt:\n"
+                f"{request.prompt}\n"
+                "Command:\n"
+                f"{self._command}"
+            ),
+            schema=PasswordPromptForm,
+        )
+        if response.action != "accept":
+            return None
+        password = response.data.password.rstrip("\r\n")
+        if not password:
+            return None
+        return password
 
 
 def _owner_id(ctx: Context) -> str:
@@ -555,7 +601,7 @@ def build_server(
         return response
 
     @server.tool(
-        title="Read and redact a remote config file",
+        title="Read and redact a remote text file",
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
     )
     async def read_file(
@@ -717,6 +763,7 @@ def build_server(
 
         cancel_event = threading.Event()
         reporter = ThreadsafeProgressReporter(ctx)
+        password_requester = ThreadsafePasswordRequester(ctx, target_id=target_id, command=command)
         current_directory = None
         builtin_used = builtin is not None
         try:
@@ -760,6 +807,7 @@ def build_server(
                     reporter,
                     cancel_event,
                     resolved_working_dir,
+                    password_requester,
                 )
                 result = session_result.result
                 current_directory = session_result.session.current_directory
@@ -773,6 +821,7 @@ def build_server(
                     reporter,
                     cancel_event,
                     resolved_working_dir,
+                    password_requester,
                 )
                 current_directory = resolved_working_dir
         except SSHServiceError as exc:

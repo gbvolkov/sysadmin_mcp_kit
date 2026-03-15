@@ -10,7 +10,14 @@ from sysadmin_mcp_kit.server import build_server
 
 
 class FakeContext:
-    def __init__(self, *, approve: bool = True, approve_sensitive: bool = True, mcp_session_id: str | None = "session-1"):
+    def __init__(
+        self,
+        *,
+        approve: bool = True,
+        approve_sensitive: bool = True,
+        password: str | None = "opensesame",
+        mcp_session_id: str | None = "session-1",
+    ):
         self.request_id = "req-1"
         self.client_id = "test-client"
         self.mcp_session_id = mcp_session_id
@@ -18,6 +25,7 @@ class FakeContext:
         self.elicitation_messages: list[str] = []
         self._approve = approve
         self._approve_sensitive = approve_sensitive
+        self._password = password
 
     async def report_progress(self, progress: float, total: float | None = None, message: str | None = None) -> None:
         self.progress_events.append((progress, total, message))
@@ -30,6 +38,10 @@ class FakeContext:
         if "confirmation_token" in schema.model_fields:
             token = re.search(r"Confirmation token: ([A-Z0-9]+)", message).group(1)
             payload["confirmation_token"] = token if self._approve_sensitive else "WRONG"
+        if "password" in schema.model_fields:
+            if self._password is None:
+                return SimpleNamespace(action="decline")
+            payload["password"] = self._password
         return SimpleNamespace(action="accept", data=schema.model_validate(payload))
 
 
@@ -110,6 +122,27 @@ async def test_browse_files_and_read_file_paginate(settings, fake_ssh_service, t
     assert ctx.progress_events
 
 
+
+
+@pytest.mark.asyncio
+async def test_read_file_returns_binary_metadata_without_content(settings, fake_ssh_service, token_verifier) -> None:
+    server = build_server(settings, ssh_service=fake_ssh_service, token_verifier=token_verifier)
+    ctx = FakeContext()
+    server.get_context = lambda: ctx
+
+    data = _structured(
+        await server.call_tool(
+            "read_file",
+            {"target_id": "cheetan", "path": "/tmp/archive.bin", "page_lines": 20},
+        )
+    )
+
+    assert data["summary"]["binary"] is True
+    assert data["redaction"]["binary"] is True
+    assert data["content"] is None
+    assert data["next_cursor"] is None
+
+
 @pytest.mark.asyncio
 async def test_run_command_reports_progress_and_paginates_output(settings, fake_ssh_service, token_verifier) -> None:
     server = build_server(settings, ssh_service=fake_ssh_service, token_verifier=token_verifier)
@@ -144,6 +177,25 @@ async def test_run_command_reports_progress_and_paginates_output(settings, fake_
     )
     assert next_data["content"]["returned_lines"] == 25
     assert next_data["stream"] == "stdout"
+
+
+@pytest.mark.asyncio
+async def test_run_command_elicits_password_when_remote_command_requests_it(settings, fake_ssh_service, token_verifier) -> None:
+    server = build_server(settings, ssh_service=fake_ssh_service, token_verifier=token_verifier)
+    ctx = FakeContext(mcp_session_id=None)
+    server.get_context = lambda: ctx
+
+    data = _structured(
+        await server.call_tool(
+            "run_command",
+            {"target_id": "cheetan", "command": "need-password"},
+        )
+    )
+
+    assert fake_ssh_service.command_calls == [("cheetan", "need-password", 90, None)]
+    assert data["stdout"]["text"].strip() == "password accepted"
+    assert len(ctx.elicitation_messages) == 2
+    assert "Remote command requested password input." in ctx.elicitation_messages[1]
 
 
 @pytest.mark.asyncio

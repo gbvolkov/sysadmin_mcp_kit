@@ -15,6 +15,7 @@ OAuth-protected MCP server for controlled SSH command execution and remote confi
 - Native MCP client CLI that talks to the running server over `streamable-http`
 - Interactive CLI mode for choosing actions and entering parameters step by step
 - Persistent remote shell sessions for MCP and interactive CLI usage, so working directory, exported variables, and activated virtualenvs survive across calls
+- Remote password and passphrase prompts can be fulfilled through MCP elicitation without logging the secret or mixing it into command output
 
 ## Configuration
 

@@ -13,7 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from sysadmin_mcp_kit.config import AppSettings
-from sysadmin_mcp_kit.ssh import BrowseResult, CommandRunResult, FileBytesResult, PersistentShellCommandResult, RemoteFileEntry, SSHServiceError
+from sysadmin_mcp_kit.ssh import BrowseResult, CommandRunResult, FileBytesResult, PasswordPromptRequest, PersistentShellCommandResult, RemoteFileEntry, SSHServiceError
 
 
 class StaticTokenVerifier:
@@ -47,7 +47,15 @@ class FakePersistentShell:
     def close(self) -> None:
         self._closed = True
 
-    def run_command(self, command: str, timeout_seconds: int, progress_callback, cancel_event, working_directory: str | None = None) -> PersistentShellCommandResult:
+    def run_command(
+        self,
+        command: str,
+        timeout_seconds: int,
+        progress_callback,
+        cancel_event,
+        working_directory: str | None = None,
+        password_prompt_callback=None,
+    ) -> PersistentShellCommandResult:
         if self._closed:
             raise SSHServiceError("Persistent shell session is not available")
         if working_directory is not None:
@@ -80,6 +88,19 @@ class FakePersistentShell:
             pass
         elif stripped == "pwd":
             stdout = f"{self._current_directory}\n".encode("utf-8")
+        elif stripped == "need-password":
+            if password_prompt_callback is None:
+                raise SSHServiceError("Remote command requested password input: [sudo] password for test-user:")
+            password = password_prompt_callback(
+                PasswordPromptRequest(
+                    prompt="[sudo] password for test-user:",
+                    attempt=1,
+                    timeout_seconds=float(timeout_seconds),
+                )
+            )
+            if password != "opensesame":
+                raise SSHServiceError("Remote password prompt was declined")
+            stdout = b"password accepted\n"
         elif stripped.startswith("ls"):
             stdout = f"listing {self._current_directory}\n".encode("utf-8")
         elif stripped.startswith("export ") and "=" in stripped[7:]:
@@ -137,6 +158,9 @@ class FakeSSHService:
 
     def read_file_bytes(self, target_id: str, path: str, max_bytes: int) -> FileBytesResult:
         self.file_reads.append((target_id, path, max_bytes))
+        if path.endswith(".bin"):
+            binary_data = b"\x00\x01\x02\x03"
+            return FileBytesResult(path=path, size_bytes=len(binary_data), data=binary_data[:max_bytes], source_truncated=False)
         return FileBytesResult(path=path, size_bytes=len(self._file_data), data=self._file_data[:max_bytes], source_truncated=False)
 
     def resolve_directory(self, target_id: str, path: str, current_directory: str | None = None) -> str:
@@ -148,12 +172,34 @@ class FakeSSHService:
     def open_persistent_shell(self, target_id: str, initial_directory: str) -> FakePersistentShell:
         return FakePersistentShell(self, target_id, initial_directory)
 
-    def run_command(self, target_id: str, command: str, timeout_seconds: int, progress_callback, cancel_event, working_directory: str | None = None) -> CommandRunResult:
+    def run_command(
+        self,
+        target_id: str,
+        command: str,
+        timeout_seconds: int,
+        progress_callback,
+        cancel_event,
+        working_directory: str | None = None,
+        password_prompt_callback=None,
+    ) -> CommandRunResult:
         self.command_calls.append((target_id, command, timeout_seconds, working_directory))
         progress_callback(0.4, "command running")
         progress_callback(0.8, "command almost done")
         if command == "pwd":
             stdout = f"{working_directory or '/'}\n".encode("utf-8")
+        elif command == "need-password":
+            if password_prompt_callback is None:
+                raise SSHServiceError("Remote command requested password input: [sudo] password for test-user:")
+            password = password_prompt_callback(
+                PasswordPromptRequest(
+                    prompt="[sudo] password for test-user:",
+                    attempt=1,
+                    timeout_seconds=float(timeout_seconds),
+                )
+            )
+            if password != "opensesame":
+                raise SSHServiceError("Remote password prompt was declined")
+            stdout = b"password accepted\n"
         elif command.startswith("ls") and working_directory is not None:
             stdout = f"listing {working_directory}\n".encode("utf-8")
         else:

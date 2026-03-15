@@ -14,6 +14,14 @@ from .config import DEFAULT_TEXT_PATTERNS, RedactionSettings
 
 REDACTED = "<REDACTED>"
 BUILTIN_PATTERN_SET = set(DEFAULT_TEXT_PATTERNS)
+ENV_REFERENCE_PATTERNS = [
+    re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$"),
+    re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*(?::[-=?+][^}]*)?\}$"),
+    re.compile(r"^%[A-Za-z_][A-Za-z0-9_]*%$"),
+    re.compile(r"^(?:env|ENV)\([A-Za-z_][A-Za-z0-9_]*\)$"),
+    re.compile(r"^[A-Z_][A-Z0-9_]*$"),
+    re.compile(r"^[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]*$"),
+]
 
 
 @dataclass(frozen=True)
@@ -97,14 +105,33 @@ class Redactor:
     def _is_sensitive_key(self, key: str) -> bool:
         return any(pattern.search(key) for pattern in self._key_patterns)
 
+    @staticmethod
+    def _strip_wrapping_quotes(value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+            return stripped[1:-1].strip()
+        return stripped
+
+    def _is_env_reference_value(self, value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        stripped = self._strip_wrapping_quotes(value)
+        return any(pattern.fullmatch(stripped) for pattern in ENV_REFERENCE_PATTERNS)
+
+    def _redact_sensitive_value(self, value: Any) -> tuple[Any, int]:
+        if self._is_env_reference_value(value):
+            return value, 0
+        return REDACTED, 1
+
     def _redact_value(self, value: Any) -> tuple[Any, int]:
         if isinstance(value, dict):
             total = 0
             output: dict[str, Any] = {}
             for key, item in value.items():
                 if self._is_sensitive_key(str(key)):
-                    output[str(key)] = REDACTED
-                    total += 1
+                    redacted_value, count = self._redact_sensitive_value(item)
+                    output[str(key)] = redacted_value
+                    total += count
                 else:
                     redacted, count = self._redact_value(item)
                     output[str(key)] = redacted
@@ -143,8 +170,10 @@ class Redactor:
         for section in parser.sections():
             for option in list(parser[section]):
                 if self._is_sensitive_key(option):
-                    parser[section][option] = REDACTED
-                    replacements += 1
+                    value = parser[section][option]
+                    if not self._is_env_reference_value(value):
+                        parser[section][option] = REDACTED
+                        replacements += 1
         from io import StringIO
 
         handle = StringIO()
@@ -161,8 +190,11 @@ class Redactor:
                 continue
             key, value = line.split("=", 1)
             if self._is_sensitive_key(key.strip()):
-                lines.append(f"{key}={REDACTED}")
-                replacements += 1
+                if self._is_env_reference_value(value):
+                    lines.append(line)
+                else:
+                    lines.append(f"{key}={REDACTED}")
+                    replacements += 1
             else:
                 lines.append(line)
         return "\n".join(lines), replacements
@@ -217,11 +249,20 @@ class Redactor:
         text, count = self._bearer_pattern.subn(bearer_replacement, text)
         total += count
 
+        assignment_count = 0
+
         def assignment_replacement(match: re.Match[str]) -> str:
+            nonlocal assignment_count
+            value = match.group(2)
+            if self._is_env_reference_value(value):
+                return match.group(0)
+            if self._strip_wrapping_quotes(value) == REDACTED:
+                return match.group(0)
+            assignment_count += 1
             return f"{match.group(1)}{REDACTED}"
 
-        text, count = self._assignment_pattern.subn(assignment_replacement, text)
-        total += count
+        text = self._assignment_pattern.sub(assignment_replacement, text)
+        total += assignment_count
 
         def url_replacement(match: re.Match[str]) -> str:
             return f"{match.group(1)}{REDACTED}{match.group(3)}"

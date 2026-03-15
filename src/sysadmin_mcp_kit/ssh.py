@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import posixpath
+import re
 import shlex
 import socket
 import stat
@@ -47,6 +48,33 @@ class FileBytesResult:
 
 
 @dataclass(frozen=True)
+class PasswordPromptRequest:
+    prompt: str
+    attempt: int
+    timeout_seconds: float | None
+
+
+PasswordPromptHandler = Callable[[PasswordPromptRequest], str | None]
+_PASSWORD_PROMPT_RE = re.compile(r"(?im)(?:^|[\r\n])(?P<prompt>[^\r\n]*(?:password|passphrase)[^\r\n]*:\s*)$")
+_MAX_PASSWORD_PROMPTS = 3
+_MCP_SUDO_PROMPT = "[sysadmin-mcp] password: "
+_SUDO_SHORT_OPTIONS_WITH_VALUE = {"C", "D", "R", "T", "U", "g", "h", "p", "r", "t", "u"}
+_SUDO_LONG_OPTIONS_WITH_VALUE = {
+    "--chdir",
+    "--chroot",
+    "--close-from",
+    "--command-timeout",
+    "--group",
+    "--host",
+    "--other-user",
+    "--prompt",
+    "--role",
+    "--type",
+    "--user",
+}
+
+
+@dataclass(frozen=True)
 class CommandRunResult:
     exit_code: int | None
     stdout: bytes
@@ -61,6 +89,136 @@ class PersistentShellCommandResult:
     result: CommandRunResult
     current_directory: str
 
+
+def _inspect_sudo_command(command: str) -> tuple[str | None, bool, bool, bool, bool]:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None, False, False, False, False
+
+    if not tokens or posixpath.basename(tokens[0]) != "sudo":
+        return None, False, False, False, False
+
+    has_stdin = False
+    has_prompt = False
+    has_askpass = False
+    has_noninteractive = False
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if not token.startswith("-") or token == "-":
+            break
+
+        if token.startswith("--"):
+            option_name, separator, _value = token.partition("=")
+            if option_name == "--stdin":
+                has_stdin = True
+            elif option_name == "--prompt":
+                has_prompt = True
+            elif option_name == "--askpass":
+                has_askpass = True
+            elif option_name == "--non-interactive":
+                has_noninteractive = True
+            if option_name in _SUDO_LONG_OPTIONS_WITH_VALUE and not separator:
+                index += 1
+            index += 1
+            continue
+
+        skip_next_value = False
+        short_options = token[1:]
+        for position, option in enumerate(short_options):
+            if option == "S":
+                has_stdin = True
+            elif option == "p":
+                has_prompt = True
+            elif option == "A":
+                has_askpass = True
+            elif option == "n":
+                has_noninteractive = True
+            if option in _SUDO_SHORT_OPTIONS_WITH_VALUE:
+                if position == len(short_options) - 1:
+                    skip_next_value = True
+                break
+        index += 2 if skip_next_value else 1
+
+    return tokens[0], has_stdin, has_prompt, has_askpass, has_noninteractive
+
+
+def _insert_sudo_options(command: str, sudo_token: str, insertions: list[str]) -> str:
+    if not insertions:
+        return command
+    rewritten, substitutions = re.subn(
+        rf"^(\s*{re.escape(sudo_token)}\b)",
+        rf"\1 {' '.join(insertions)}",
+        command,
+        count=1,
+    )
+    return rewritten if substitutions else command
+
+
+def _prepare_command_for_password_prompts(command: str) -> str:
+    sudo_token, has_stdin, has_prompt, has_askpass, has_noninteractive = _inspect_sudo_command(command)
+    if sudo_token is None or has_askpass or has_noninteractive:
+        return command
+
+    insertions: list[str] = []
+    if not has_stdin:
+        insertions.append("-S")
+    if not has_prompt:
+        insertions.extend(["-p", shlex.quote(_MCP_SUDO_PROMPT)])
+    return _insert_sudo_options(command, sudo_token, insertions)
+
+
+def _prepare_command_for_persistent_password_prompts(
+    command: str,
+    *,
+    timeout_seconds: int,
+    progress_callback: Callable[[float, str], None],
+    password_prompt_callback: PasswordPromptHandler | None,
+) -> str:
+    sudo_token, has_stdin, has_prompt, has_askpass, has_noninteractive = _inspect_sudo_command(command)
+    if sudo_token is None or has_askpass or has_noninteractive or has_stdin:
+        return command
+    if password_prompt_callback is None:
+        return command
+
+    progress_callback(0.04, f"Remote command is waiting for password input: {_MCP_SUDO_PROMPT.strip()}")
+    password = password_prompt_callback(
+        PasswordPromptRequest(
+            prompt=_MCP_SUDO_PROMPT.strip(),
+            attempt=1,
+            timeout_seconds=float(timeout_seconds),
+        )
+    )
+    if password is None:
+        raise SSHServiceError("Remote password prompt was declined")
+
+    secret = password.rstrip("\r\n")
+    if not secret:
+        raise SSHServiceError("Remote password prompt was not completed")
+
+    insertions = ["-A"]
+    if not has_prompt:
+        insertions.extend(["-p", shlex.quote(_MCP_SUDO_PROMPT)])
+    wrapped_command = _insert_sudo_options(command, sudo_token, insertions)
+    quoted_secret = shlex.quote(secret)
+    lines = [
+        '__sysadmin_mcp_askpass=$(mktemp)',
+        'cat > "$__sysadmin_mcp_askpass" <<\'__SYSADMIN_MCP_ASKPASS__\'',
+        '#!/bin/sh',
+        f"printf '%s\\n' {quoted_secret}",
+        '__SYSADMIN_MCP_ASKPASS__',
+        'chmod 700 "$__sysadmin_mcp_askpass"',
+        'export SUDO_ASKPASS="$__sysadmin_mcp_askpass"',
+        wrapped_command,
+        '__sysadmin_mcp_inner_status=$?',
+        'rm -f "$__sysadmin_mcp_askpass"',
+        'unset SUDO_ASKPASS',
+        '(exit "$__sysadmin_mcp_inner_status")',
+    ]
+    return "\n".join(lines)
 
 class PersistentShellSession:
     def __init__(
@@ -117,14 +275,23 @@ class PersistentShellSession:
         progress_callback: Callable[[float, str], None],
         cancel_event: threading.Event,
         working_directory: str | None = None,
+        password_prompt_callback: PasswordPromptHandler | None = None,
     ) -> PersistentShellCommandResult:
         with self._lock:
             if self.is_closed:
                 raise SSHServiceError("Persistent shell session is not available")
 
             token = uuid.uuid4().hex.upper()
-            script = self._build_script(command, token, working_directory)
+            prepared_command = _prepare_command_for_persistent_password_prompts(
+                command,
+                timeout_seconds=timeout_seconds,
+                progress_callback=progress_callback,
+                password_prompt_callback=password_prompt_callback,
+            )
+            script = self._build_script(prepared_command, token, working_directory)
             started_at = time.monotonic()
+            prompt_attempts = 0
+            last_prompt_state: tuple[str, str, int, int] | None = None
             progress_callback(0.05, "Running command in persistent shell")
             try:
                 self._channel.sendall(script.encode("utf-8"))
@@ -169,6 +336,24 @@ class PersistentShellSession:
                         current_directory=current_directory,
                     )
 
+                try:
+                    prompt_attempts, last_prompt_state = _maybe_handle_password_prompt(
+                        channel=self._channel,
+                        stdout_tail=self._stdout_buffer[-1024:],
+                        stderr_tail=self._stderr_buffer[-1024:],
+                        stdout_length=len(self._stdout_buffer),
+                        stderr_length=len(self._stderr_buffer),
+                        timeout_seconds=timeout_seconds,
+                        started_at=started_at,
+                        progress_callback=progress_callback,
+                        password_prompt_callback=password_prompt_callback,
+                        prompt_attempts=prompt_attempts,
+                        last_prompt_state=last_prompt_state,
+                    )
+                except SSHServiceError:
+                    self.close()
+                    raise
+
                 if self._channel.closed or self._channel.exit_status_ready():
                     self._collect_partial_output_and_close()
                     raise SSHServiceError("Persistent shell session terminated unexpectedly")
@@ -200,7 +385,7 @@ class PersistentShellSession:
                 time.sleep(0.05)
 
     def _build_script(self, command: str, token: str, working_directory: str | None) -> str:
-        command_literal = shlex.quote(command)
+        command_literal = shlex.quote(_prepare_command_for_password_prompts(command))
         lines: list[str] = []
         if working_directory is not None:
             lines.extend(
@@ -284,6 +469,69 @@ class PersistentShellSession:
         return stdout, stderr
 
 
+def _detect_password_prompt(stdout_tail: bytes, stderr_tail: bytes) -> tuple[str, str] | None:
+    for stream_name, tail in (("stderr", stderr_tail), ("stdout", stdout_tail)):
+        decoded = tail.decode("utf-8", errors="replace")
+        match = _PASSWORD_PROMPT_RE.search(decoded)
+        if match is not None:
+            return stream_name, match.group("prompt").strip()
+    return None
+
+
+def _maybe_handle_password_prompt(
+    *,
+    channel: paramiko.Channel,
+    stdout_tail: bytes,
+    stderr_tail: bytes,
+    stdout_length: int,
+    stderr_length: int,
+    timeout_seconds: int,
+    started_at: float,
+    progress_callback: Callable[[float, str], None],
+    password_prompt_callback: PasswordPromptHandler | None,
+    prompt_attempts: int,
+    last_prompt_state: tuple[str, str, int, int] | None,
+) -> tuple[int, tuple[str, str, int, int] | None]:
+    detected_prompt = _detect_password_prompt(stdout_tail, stderr_tail)
+    if detected_prompt is None:
+        return prompt_attempts, None
+
+    stream_name, prompt = detected_prompt
+    prompt_state = (stream_name, prompt, stdout_length, stderr_length)
+    if prompt_state == last_prompt_state:
+        return prompt_attempts, last_prompt_state
+
+    if prompt_attempts >= _MAX_PASSWORD_PROMPTS:
+        raise SSHServiceError(f"Remote command requested password input too many times: {prompt}")
+
+    if password_prompt_callback is None:
+        raise SSHServiceError(f"Remote command requested password input: {prompt}")
+
+    remaining_timeout = max(1.0, timeout_seconds - (time.monotonic() - started_at))
+    attempt = prompt_attempts + 1
+    progress_callback(min(0.95, 0.2 + (attempt * 0.05)), f"Remote command is waiting for password input: {prompt}")
+    password = password_prompt_callback(
+        PasswordPromptRequest(
+            prompt=prompt,
+            attempt=attempt,
+            timeout_seconds=remaining_timeout,
+        )
+    )
+    if password is None:
+        raise SSHServiceError("Remote password prompt was declined")
+
+    secret = password.rstrip("\r\n")
+    if not secret:
+        raise SSHServiceError("Remote password prompt was not completed")
+
+    try:
+        channel.sendall((secret + "\n").encode("utf-8"))
+    except Exception as exc:
+        raise SSHServiceError("Failed to send password input to the remote command") from exc
+
+    return attempt, prompt_state
+
+
 class SSHService:
     def __init__(self, settings: AppSettings):
         self._settings = settings
@@ -334,7 +582,7 @@ class SSHService:
 
     def read_file_bytes(self, target_id: str, path: str, max_bytes: int) -> FileBytesResult:
         target = self.get_target(target_id)
-        normalized_path = self._validate_remote_path(target, path)
+        normalized_path = self._validate_readable_file_path(target, path)
 
         with self._connect(target) as client:
             sftp = client.open_sftp()
@@ -416,13 +664,16 @@ class SSHService:
         progress_callback: Callable[[float, str], None],
         cancel_event: threading.Event,
         working_directory: str | None = None,
+        password_prompt_callback: PasswordPromptHandler | None = None,
     ) -> CommandRunResult:
         target = self.get_target(target_id)
         progress_callback(0.05, "Connecting to remote target")
         started_at = time.monotonic()
-        remote_command = command
+        prompt_attempts = 0
+        last_prompt_state: tuple[str, str, int, int] | None = None
+        remote_command = _prepare_command_for_password_prompts(command)
         if working_directory is not None:
-            remote_command = f"cd -- {shlex.quote(working_directory)} && {command}"
+            remote_command = f"cd -- {shlex.quote(working_directory)} && {remote_command}"
 
         with self._connect(target) as client:
             transport = client.get_transport()
@@ -435,6 +686,10 @@ class SSHService:
 
             stdout_chunks: list[bytes] = []
             stderr_chunks: list[bytes] = []
+            stdout_tail = b""
+            stderr_tail = b""
+            stdout_bytes = 0
+            stderr_bytes = 0
             timed_out = False
             cancelled = False
             heartbeat = 0
@@ -449,11 +704,35 @@ class SSHService:
 
                     drained = False
                     while channel.recv_ready():
-                        stdout_chunks.append(channel.recv(32768))
+                        chunk = channel.recv(32768)
+                        stdout_chunks.append(chunk)
+                        stdout_tail = (stdout_tail + chunk)[-1024:]
+                        stdout_bytes += len(chunk)
                         drained = True
                     while channel.recv_stderr_ready():
-                        stderr_chunks.append(channel.recv_stderr(32768))
+                        chunk = channel.recv_stderr(32768)
+                        stderr_chunks.append(chunk)
+                        stderr_tail = (stderr_tail + chunk)[-1024:]
+                        stderr_bytes += len(chunk)
                         drained = True
+
+                    try:
+                        prompt_attempts, last_prompt_state = _maybe_handle_password_prompt(
+                            channel=channel,
+                            stdout_tail=stdout_tail,
+                            stderr_tail=stderr_tail,
+                            stdout_length=stdout_bytes,
+                            stderr_length=stderr_bytes,
+                            timeout_seconds=timeout_seconds,
+                            started_at=started_at,
+                            progress_callback=progress_callback,
+                            password_prompt_callback=password_prompt_callback,
+                            prompt_attempts=prompt_attempts,
+                            last_prompt_state=last_prompt_state,
+                        )
+                    except SSHServiceError:
+                        channel.close()
+                        raise
 
                     if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                         break
@@ -468,16 +747,19 @@ class SSHService:
                     if drained or now - last_progress_time >= self._settings.server.progress_report_interval_seconds:
                         heartbeat += 1
                         progress = min(0.95, 0.15 + (heartbeat * 0.05))
-                        bytes_seen = sum(len(chunk) for chunk in stdout_chunks) + sum(len(chunk) for chunk in stderr_chunks)
-                        progress_callback(progress, f"Remote command still running; collected {bytes_seen} bytes")
+                        progress_callback(progress, f"Remote command still running; collected {stdout_bytes + stderr_bytes} bytes")
                         last_progress_time = now
 
                     time.sleep(0.1)
 
                 while channel.recv_ready():
-                    stdout_chunks.append(channel.recv(32768))
+                    chunk = channel.recv(32768)
+                    stdout_chunks.append(chunk)
+                    stdout_bytes += len(chunk)
                 while channel.recv_stderr_ready():
-                    stderr_chunks.append(channel.recv_stderr(32768))
+                    chunk = channel.recv_stderr(32768)
+                    stderr_chunks.append(chunk)
+                    stderr_bytes += len(chunk)
 
                 exit_code = None
                 if not timed_out and not cancelled:
@@ -634,6 +916,9 @@ class SSHService:
 
     def _validate_remote_path(self, target: TargetSettings, path: str) -> str:
         return self._normalize_directory_path(target, path)
+
+    def _validate_readable_file_path(self, target: TargetSettings, path: str) -> str:
+        return self._normalize_directory_path(target, path, enforce_allowlist=False)
 
     @staticmethod
     def _is_path_allowed(target: TargetSettings, normalized_path: str) -> bool:

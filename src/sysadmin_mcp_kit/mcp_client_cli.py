@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import shlex
@@ -417,8 +418,14 @@ class MCPCLI:
                 content[field_name] = value
                 continue
 
-            prompted = self._ask(f"{title}: ").strip()
+            is_secret = self._is_secret_field(field_name, field_schema)
+            if is_secret:
+                prompted = self._ask_secret(f"{title}: ").rstrip("\r\n")
+            else:
+                prompted = self._ask(f"{title}: ").strip()
             if not prompted:
+                if is_secret:
+                    return types.ElicitResult(action="cancel")
                 content[field_name] = None
                 continue
             if field_type == "boolean":
@@ -433,6 +440,21 @@ class MCPCLI:
                 content[field_name] = prompted
 
         return types.ElicitResult(action="accept", content=content)
+
+    @staticmethod
+    def _is_secret_field(field_name: str, field_schema: dict[str, Any]) -> bool:
+        if str(field_schema.get("format", "")).lower() == "password":
+            return True
+        name = field_name.lower()
+        title = str(field_schema.get("title") or "").lower()
+        description = str(field_schema.get("description") or "").lower()
+        return any(token in name or token in title or token in description for token in ("password", "passphrase", "secret"))
+
+    def _ask_secret(self, prompt: str) -> str:
+        if self._input is input:
+            return getpass.getpass(prompt, stream=self._stderr)
+        print(prompt, end="", file=self._stderr)
+        return self._input("")
 
     async def _progress_callback(self, progress: float, total: float | None, message: str | None) -> None:
         total_text = f"/{total:0.2f}" if total is not None else ""

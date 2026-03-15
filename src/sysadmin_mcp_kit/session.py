@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from typing import Callable
 
-from .ssh import CommandRunResult, PersistentShellSession, SSHService, SSHServiceError
+from .ssh import CommandRunResult, PasswordPromptHandler, PersistentShellSession, SSHService, SSHServiceError
 
 
 class SessionStoreError(KeyError):
@@ -201,6 +201,7 @@ class TerminalSessionService:
         progress_callback: Callable[[float, str], None],
         cancel_event: threading.Event,
         working_directory: str | None = None,
+        password_prompt_callback: PasswordPromptHandler | None = None,
     ) -> SessionCommandResult:
         session = self._store.get(owner_id, session_id)
         builtin = parse_builtin_command(command)
@@ -224,6 +225,7 @@ class TerminalSessionService:
                 progress_callback,
                 cancel_event,
                 working_directory=working_directory,
+                password_prompt_callback=password_prompt_callback,
             )
         except SSHServiceError:
             if session.shell.is_closed:
@@ -247,6 +249,7 @@ class TerminalSessionService:
         progress_callback: Callable[[float, str], None],
         cancel_event: threading.Event,
         working_directory: str | None = None,
+        password_prompt_callback: PasswordPromptHandler | None = None,
     ) -> SessionCommandResult:
         session = self.get_or_create_context_session(owner_id, context_id, target_id)
         return self.execute_command(
@@ -257,6 +260,7 @@ class TerminalSessionService:
             progress_callback,
             cancel_event,
             working_directory=working_directory,
+            password_prompt_callback=password_prompt_callback,
         )
 
     def _execute_builtin(
