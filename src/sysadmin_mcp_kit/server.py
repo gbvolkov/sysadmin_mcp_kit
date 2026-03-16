@@ -10,6 +10,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 from .auth import IntrospectionTokenVerifier
@@ -440,6 +441,23 @@ def build_server(
         token_verifier=token_verifier,
         session_service=session_service,
     )
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "127.0.0.1:*",
+            "localhost:*",
+            "[::1]:*",
+            "mcp.gbvolkoff.name",
+            "mcp.gbvolkoff.name:*",
+        ],
+        allowed_origins=[
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+            "https://mcp.gbvolkoff.name:8443",
+        ],
+    )
+
     runtime = _ServerRuntime(deps)
 
     server = FastMCP(
@@ -453,6 +471,7 @@ def build_server(
         auth=settings.oauth.to_auth_settings(),
         token_verifier=deps.token_verifier,
         log_level=settings.server.log_level,
+        transport_security=transport_security,
     )
     if settings.server.stateless_http:
         logger.warning("stateless_http=true disables implicit terminal context across run_command calls")
