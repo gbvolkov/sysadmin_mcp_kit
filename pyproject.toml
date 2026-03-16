@@ -5,7 +5,7 @@ description = "Secure MCP server for remote SSH command execution and config ins
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "httpx>=0.28.1",
+    "httpx[http2]>=0.28.1",
     "mcp>=1.26.0,<2",
     "paramiko>=4.0.0",
     "pydantic>=2.11.0",
